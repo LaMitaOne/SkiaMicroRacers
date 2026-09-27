@@ -1,5 +1,5 @@
 {*******************************************************************************
-  SkiaMicroRacers (Top-Down Racer Prototype)
+  SkiaMicroRacers v0.2 (Top-Down Racer Prototype)
 ********************************************************************************
   A top-down racing game built entirely with Skia4Delphi.
   Architecture & Features:
@@ -7,13 +7,16 @@
     Racing -> Results Screen.
   - Surface Detection: Point-to-line-segment distance determines if a car is
     on asphalt or grass, dynamically changing acceleration and friction.
+  - Procedural Track Generation: Star-shaped closed curve in polar coordinates,
+    regenerated until max turn angles are below safe limits.
   - AI Opponents: Computer-controlled cars navigate the track by steering
-    towards target waypoints. They have slight lateral offsets to create
-    varied racing lines.
+    towards target waypoints. They feature look-ahead braking for sharp corners,
+    rubber-banding to keep races close, and speed-dependent waypoint switching.
   - Collision Physics: Cars push each other apart upon collision, transferring
     momentum and causing visual spins, allowing for aggressive ramming.
   - Camera System: A dynamic, rotating follow-camera aligns smoothly with the
     player's car heading using linear interpolation.
+  - Level Progression: Winning a race increments the level, making AI faster.
   Author:  Lara Miriam Tamy Reschke
   License: MIT
 *******************************************************************************}
@@ -68,6 +71,7 @@ type
     Finished: Boolean;
     FinalRank: Integer;
     Offset: Single;         // AI specific: Lateral offset from track center to create varied lines
+    WaypointTimer: Single;  // AI specific: Timer to force-switch waypoints if stuck
     constructor Create(AName: string; AColor: Cardinal; AIsPlayer: Boolean);
     procedure Reset(AX, AY: Single; AAngle: Single);
   end;
@@ -85,11 +89,14 @@ type
     // Track Data
     FTrackPoints: TArray<TTrackPoint>; // Array defining the track's center line
     FTrackWidth: Single;               // Total width of the drivable road
+    FStartIndex: Integer;              // The index of the point defining the start/finish line
     // Game Logic
     FGameState: TGameState;
     FCountdownTimer: Single;
     FRaceTimer: Single;
     FTotalLaps: Integer;
+    FLevel: Integer;           // Current difficulty level
+    FWins: Integer;           // Total races won by the player
     // Cars
     FCars: TObjectList<TCar>;
     FPlayerCar: TCar;
@@ -108,6 +115,7 @@ type
     procedure StartThread;
     procedure StopThread;
     function MeasureTextWidth(const AText: string; const AFont: ISkFont; const APaint: ISkPaint): Single;
+    function LevelMul: Single;
   protected
     // Rendering & Input
     procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
@@ -119,6 +127,36 @@ type
   end;
 
 implementation
+
+const
+  // Difficulty scaling
+  LEVEL_STEP = 0.06;
+  LEVEL_MAX_MUL = 1.60;
+  PLAYER_BONUS = 5.0;
+
+  // Base AI (level 1)
+  AI_BASE_SPEED = 270.0;
+  AI_BASE_ACCEL = 420.0;
+
+  // AI waypoint following
+  AI_WP_MIN_RADIUS = 70.0;
+  AI_WP_SPEED_FACTOR = 0.30;
+  AI_OFFSET_LIMIT = 15.0;
+  AI_WP_TIMEOUT = 2.0;
+
+  // AI look-ahead braking
+  AI_CORNER_START = 15.0;
+  AI_CORNER_FULL = 90.0;
+  AI_CORNER_MIN_MUL = 0.50;
+
+  // Track generator
+  NUM_POINTS = 32;
+  BASE_RADIUS = 720.0;
+  WORLD_CENTER_X = 1500.0;
+  WORLD_CENTER_Y = 1500.0;
+  MAX_ALLOWED_TURN = 24.0;
+  MAX_GEN_ATTEMPTS = 80;
+
 { TCar }
 
 constructor TCar.Create(AName: string; AColor: Cardinal; AIsPlayer: Boolean);
@@ -142,8 +180,10 @@ begin
   CanCountLap := False;
   Finished := False;
   FinalRank := 0;
-  FTargetIndex := 1; // Aim for the waypoint immediately after the start line
+  FTargetIndex := 1;
+  WaypointTimer := 0;
 end;
+
 { TSkiaMicroRacers }
 
 constructor TSkiaMicroRacers.Create(AOwner: TComponent);
@@ -159,6 +199,8 @@ begin
   FActive := True;
   FTotalLaps := 3;
   FCars := TObjectList<TCar>.Create(True); // True = List owns the objects and frees them
+  FLevel := 1;
+  FWins := 0;
   InitRace;
   // Start the background physics/render loop
   StartThread;
@@ -171,23 +213,37 @@ begin
   FreeAndNil(FLock);
   inherited;
 end;
-{ Initializes a new race. Resets cars, track, and game state to default. }
 
+{ Initializes a new race. Resets cars, track, and game state to default. }
 procedure TSkiaMicroRacers.InitRace;
 var
   I: Integer;
   Car: TCar;
-  StartX, StartY: Single;
   Colors: array[0..3] of Cardinal;
+  StartPtX, StartPtY, StartAng: Single;
+  AlongOffset, LateralOffset: Single;
+  DirX, DirY, PerpX, PerpY: Single;
 begin
   // Define car colors (Red, Blue, Green, Yellow)
   Colors[0] := $FFFF0000;
   Colors[1] := $FF0000FF;
   Colors[2] := $FF00FF00;
   Colors[3] := $FFFFFF00;
+
   FTrackWidth := 180; // Width of the road in pixels
   GenerateTrack;      // Generate a new random track layout
   FCars.Clear;
+
+  // Determine start position and orientation based on generated track
+  StartPtX := FTrackPoints[FStartIndex].X;
+  StartPtY := FTrackPoints[FStartIndex].Y;
+  StartAng := FTrackPoints[FStartIndex].Angle;
+
+  DirX  := Cos(DegToRad(StartAng));
+  DirY  := Sin(DegToRad(StartAng));
+  PerpX := -DirY;
+  PerpY :=  DirX;
+
   // Create Player and 3 AI Cars
   for I := 0 to 3 do
   begin
@@ -195,18 +251,28 @@ begin
       Car := TCar.Create('Player', Colors[I], True)
     else
       Car := TCar.Create('AI ' + IntToStr(I), Colors[I], False);
-    // Cars start EXACTLY in the middle of the long straight section.
-    // The straight goes from X=800 to X=1800. Middle is 1100.
-    StartX := 1100;
-    StartY := 750;
-    // Apply a slight backward offset for a realistic grid start
-    StartX := StartX - (I * 45); // Move backwards along the straight
-    StartY := StartY - ((I mod 2) * 40 - 20); // Slight lateral offset
-    Car.Reset(StartX, StartY, 0); // Angle 0 means facing right
+
+    // Arrange cars in a grid format behind the start line
+    AlongOffset   := -I * 45;
+    LateralOffset := ((I mod 2) * 40) - 20;
+
+    Car.Reset(
+      StartPtX + DirX * AlongOffset + PerpX * LateralOffset,
+      StartPtY + DirY * AlongOffset + PerpY * LateralOffset,
+      StartAng);
+
     // Give AI a preferred lane offset so they don't drive perfectly on the center line
     Car.Offset := ((I * 40) mod 100) - 50;
+    if Car.Offset > AI_OFFSET_LIMIT then Car.Offset := AI_OFFSET_LIMIT;
+    if Car.Offset < -AI_OFFSET_LIMIT then Car.Offset := -AI_OFFSET_LIMIT;
+
+    // Set the first waypoint target
+    Car.FTargetIndex := (FStartIndex + 1) mod NUM_POINTS;
+    Car.WaypointTimer := 0;
+
     FCars.Add(Car);
   end;
+
   FPlayerCar := FCars[0];
   // Snap camera to player immediately
   FCameraX := FPlayerCar.X;
@@ -214,74 +280,107 @@ begin
   FCameraAngle := FPlayerCar.Angle;
   FGameState := gsReady;
 end;
-{
-  Generates a race track with wide, sweeping 180-degree curves.
-  The track begins with a 1000px straight section from X=800 to X=1800.
-  After the straight, it curves smoothly downwards and back to close the loop.
-}
 
+{
+  Procedural track generation using polar coordinates and noise.
+  Generates a star-shaped closed curve and ensures curves are not too sharp.
+}
 procedure TSkiaMicroRacers.GenerateTrack;
 var
   I: Integer;
-  CenterX, CenterY, Radius: Single;
-  AngleStep, CurrentAngle: Single;
-  NumPoints: Integer;
+  Theta, R: Single;
+  NoiseA1, NoiseA2, NoiseA3: Single;
+  NoiseP1, NoiseP2, NoiseP3: Single;
+  K1, K2, K3: Integer;
+  D: TPointF;
+  BestIdx: Integer;
+  BestTurn, TurnDiff, AngleA, AngleB: Single;
+  Attempt: Integer;
+  OK: Boolean;
 begin
-  NumPoints := 16;
-  SetLength(FTrackPoints, NumPoints);
-  // 1. Hardcode the initial long straight section (X=800 to 1800, Y=750)
-  FTrackPoints[0].X := 800;
-  FTrackPoints[0].Y := 750;
-  FTrackPoints[1].X := 1000;
-  FTrackPoints[1].Y := 750;
-  FTrackPoints[2].X := 1200;
-  FTrackPoints[2].Y := 750;
-  FTrackPoints[3].X := 1400;
-  FTrackPoints[3].Y := 750;
-  FTrackPoints[4].X := 1600;
-  FTrackPoints[4].Y := 750;
-  FTrackPoints[5].X := 1800;
-  FTrackPoints[5].Y := 750; // End of straight
-  // 2. Generate Curve 1: 180 degrees down and left
-  CenterX := 1800;
-  CenterY := 1100;
-  Radius := 350;
-  AngleStep := 180 / 5; // 5 points for a 180 degree curve
-  CurrentAngle := -90;  // Start pointing down
-  for I := 6 to 10 do
+  SetLength(FTrackPoints, NUM_POINTS);
+
+  K1 := 2;
+  K2 := 3;
+  K3 := 5;
+
+  Attempt := 0;
+  OK := False;
+
+  // Regenerate track until the max turn angle is within safe limits
+  while (not OK) and (Attempt < MAX_GEN_ATTEMPTS) do
   begin
-    FTrackPoints[I].X := CenterX + Cos(DegToRad(CurrentAngle)) * Radius;
-    FTrackPoints[I].Y := CenterY + Sin(DegToRad(CurrentAngle)) * Radius;
-    CurrentAngle := CurrentAngle + AngleStep;
+    Inc(Attempt);
+    OK := True;
+
+    // Randomize noise amplitudes and phases
+    NoiseA1 := 0.07 + Random * 0.05;
+    NoiseA2 := 0.04 + Random * 0.03;
+    NoiseA3 := 0.02 + Random * 0.02;
+
+    NoiseP1 := Random * 2 * Pi;
+    NoiseP2 := Random * 2 * Pi;
+    NoiseP3 := Random * 2 * Pi;
+
+    for I := 0 to NUM_POINTS - 1 do
+    begin
+      Theta := 2 * Pi * I / NUM_POINTS;
+      R := BASE_RADIUS * (1
+        + NoiseA1 * Cos(K1 * Theta + NoiseP1)
+        + NoiseA2 * Cos(K2 * Theta + NoiseP2)
+        + NoiseA3 * Cos(K3 * Theta + NoiseP3));
+
+      FTrackPoints[I].X := WORLD_CENTER_X + Cos(Theta) * R;
+      FTrackPoints[I].Y := WORLD_CENTER_Y + Sin(Theta) * R;
+    end;
+
+    // Calculate angles for each point aiming at the next
+    for I := 0 to NUM_POINTS - 1 do
+    begin
+      D := PointF(FTrackPoints[(I+1) mod NUM_POINTS].X - FTrackPoints[I].X,
+                  FTrackPoints[(I+1) mod NUM_POINTS].Y - FTrackPoints[I].Y);
+      FTrackPoints[I].Angle := RadToDeg(ArcTan2(D.Y, D.X));
+    end;
+
+    // Check for overly sharp turns
+    for I := 0 to NUM_POINTS - 1 do
+    begin
+      AngleA := FTrackPoints[I].Angle;
+      AngleB := FTrackPoints[(I+1) mod NUM_POINTS].Angle;
+      TurnDiff := Abs(AngleB - AngleA);
+      if TurnDiff > 180 then TurnDiff := 360 - TurnDiff;
+
+      if TurnDiff > MAX_ALLOWED_TURN then
+      begin
+        OK := False;
+        Break;
+      end;
+    end;
   end;
-  // 3. Generate Straight 2: Moving Left
-  FTrackPoints[11].X := 1450;
-  FTrackPoints[11].Y := 1450;
-  FTrackPoints[12].X := 1150;
-  FTrackPoints[12].Y := 1450;
-  // 4. Generate Curve 2: 180 degrees up and left
-  CenterX := 800;
-  CenterY := 1100;
-  Radius := 350;
-  CurrentAngle := 90; // Start pointing up
-  for I := 13 to 15 do
+
+  // Find the flattest section to place the start/finish line
+  BestIdx := 0;
+  BestTurn := 99999;
+  for I := 0 to NUM_POINTS - 1 do
   begin
-    FTrackPoints[I].X := CenterX + Cos(DegToRad(CurrentAngle)) * Radius;
-    FTrackPoints[I].Y := CenterY + Sin(DegToRad(CurrentAngle)) * Radius;
-    CurrentAngle := CurrentAngle + AngleStep;
+    AngleA := FTrackPoints[I].Angle;
+    AngleB := FTrackPoints[(I+1) mod NUM_POINTS].Angle;
+    TurnDiff := Abs(AngleB - AngleA);
+    if TurnDiff > 180 then TurnDiff := 360 - TurnDiff;
+    if TurnDiff < BestTurn then
+    begin
+      BestTurn := TurnDiff;
+      BestIdx := I;
+    end;
   end;
-  // 5. Calculate the heading angle for each point aiming at the next point
-  for I := 0 to High(FTrackPoints) do
-  begin
-    FTrackPoints[I].Angle := RadToDeg(ArcTan2(FTrackPoints[(I + 1) mod Length(FTrackPoints)].Y - FTrackPoints[I].Y, FTrackPoints[(I + 1) mod Length(FTrackPoints)].X - FTrackPoints[I].X));
-  end;
+  FStartIndex := BestIdx;
 end;
+
 {
   Checks if a given coordinate (X, Y) is on the drivable road.
   Finds the shortest distance from the point to any of the track's center line
   segments. If the distance is less than half the track width, it's on track.
 }
-
 function TSkiaMicroRacers.IsOnTrack(X, Y: Single; out DistFromCenter: Single): Boolean;
 var
   I: Integer;
@@ -293,18 +392,17 @@ begin
   Result := False;
   MinDist := 99999;
   Pt := PointF(X, Y);
-  // Iterate through all line segments (Point I to Point I+1)
-  for I := 0 to High(FTrackPoints) - 1 do
+  // Iterate through all line segments (Point I to Point I+1) including the wrap-around
+  for I := 0 to High(FTrackPoints) do
   begin
     P1 := PointF(FTrackPoints[I].X, FTrackPoints[I].Y);
-    P2 := PointF(FTrackPoints[I + 1].X, FTrackPoints[I + 1].Y);
+    P2 := PointF(FTrackPoints[(I + 1) mod Length(FTrackPoints)].X, FTrackPoints[(I + 1) mod Length(FTrackPoints)].Y);
     LineVec := P2 - P1;
     PointVec := Pt - P1;
     LineLen := LineVec.Length;
     if LineLen > 0 then
     begin
       // Vector Projection: 'ProjT' is a normalized value (0.0 to 1.0)
-      // representing where the point falls along the line segment.
       ProjT := (PointVec.X * LineVec.X + PointVec.Y * LineVec.Y) / (LineLen * LineLen);
       ProjT := EnsureRange(ProjT, 0, 1);
       // Calculate the exact point on the line closest to our car
@@ -319,11 +417,19 @@ begin
   DistFromCenter := MinDist;
   Result := (MinDist <= FTrackWidth / 2);
 end;
+
+{ Calculates the AI difficulty multiplier based on current level }
+function TSkiaMicroRacers.LevelMul: Single;
+begin
+  Result := 1.0 + (FLevel - 1) * LEVEL_STEP;
+  if Result > LEVEL_MAX_MUL then
+    Result := LEVEL_MAX_MUL;
+end;
+
 {
   Main physics logic. Runs on a background thread.
   Updates timers and car positions based on elapsed time (DeltaSec).
 }
-
 procedure TSkiaMicroRacers.DoPhysicsUpdate(DeltaSec: Double);
 var
   I: Integer;
@@ -362,10 +468,11 @@ begin
   FCameraY := FCameraY + (FPlayerCar.Y - FCameraY) * 5 * DeltaSec;
   FCameraAngle := FCameraAngle + (FPlayerCar.Angle - FCameraAngle) * 2 * DeltaSec;
 end;
+
 {
   Updates player car physics based on keyboard input.
+  Max speed scales slightly with level to keep it competitive.
 }
-
 procedure TSkiaMicroRacers.UpdateCar(Car: TCar; DeltaSec: Double);
 var
   Left, Right, Up, Down: Boolean;
@@ -373,6 +480,7 @@ var
   Rad, VX, VY: Single;
   OnTrack: Boolean;
   DistFromCenter: Single;
+  MaxSpeed: Single;
 begin
   // Thread-safe reading of keyboard input
   FLock.Acquire;
@@ -401,17 +509,22 @@ begin
   Friction := 2.0;
   if not OnTrack then
     Friction := 5.0; // High friction on grass
+
+  // Player gets slightly faster with each level
+  MaxSpeed := 300 + (FLevel - 1) * PLAYER_BONUS;
+
   // Update Speed
   if Up then
-    Car.Speed := Min(Car.Speed + Accel * DeltaSec, 300) // Forward accel with cap
+    Car.Speed := Min(Car.Speed + Accel * DeltaSec, MaxSpeed)
   else if Down then
     Car.Speed := Max(Car.Speed - Accel * DeltaSec, -150) // Reverse accel with cap
   else
     Car.Speed := Car.Speed - (Car.Speed * Friction * DeltaSec); // Natural slow down
+
   // Steering (Speed-dependent). Cars shouldn't turn when stationary.
   if Abs(Car.Speed) > 5 then
   begin
-    TurnSpeed := 120 * (Car.Speed / 300);
+    TurnSpeed := 120 * (Car.Speed / MaxSpeed);
     if Left then
       Car.Angle := Car.Angle - TurnSpeed * DeltaSec;
     if Right then
@@ -425,40 +538,94 @@ begin
   Car.Y := Car.Y + VY;
   CheckLap(Car);
 end;
-{
-  Updates AI car physics. Steers towards the next track waypoint.
-}
 
+{
+  Updates AI car physics.
+  Features: Look-ahead braking for corners, speed-dependent waypoint switching,
+  timeout fallback, and rubber-banding to keep races close.
+}
 procedure TSkiaMicroRacers.UpdateAI(Car: TCar; DeltaSec: Double);
 var
-  TargetPt: TTrackPoint;
+  TargetPt, NextPt, FarPt: TTrackPoint;
   DesiredAngle, AngleDiff: Single;
-  TurnSpeed, Accel, Friction: Single;
+  TurnSpeed, Accel: Single;
   Rad, VX, VY: Single;
-  DistToTarget: Single;
-  PerpX, PerpY: Single;
-  OffsetX, OffsetY: Single;
+  DistToTarget, PlainDist: Single;
+  PerpX, PerpY, OffsetX, OffsetY: Single;
+  UseOffset, AngleDelta: Single;
   OnTrack: Boolean;
   DistFromCenter: Single;
+  LapDiff: Integer;
+  RubberMul, LevelFactor, MaxAI: Single;
+  Seg, CarToTargetVec: TPointF;
+  Dot: Single;
+  SwitchRadius: Single;
+  LookDelta, FarDelta: Single;
+  CornerMul: Single;
+  Switched: Boolean;
 begin
   if FGameState <> gsRacing then
     Exit;
-  // Get Target Point and apply lane offset
+
   TargetPt := FTrackPoints[Car.FTargetIndex];
+  NextPt   := FTrackPoints[(Car.FTargetIndex + 1) mod Length(FTrackPoints)];
+  FarPt    := FTrackPoints[(Car.FTargetIndex + 2) mod Length(FTrackPoints)];
+
+  // Disable offset in sharp corners so AI takes a tighter line
+  AngleDelta := Abs(TargetPt.Angle - NextPt.Angle);
+  if AngleDelta > 180 then AngleDelta := 360 - AngleDelta;
+  if AngleDelta > 12 then
+    UseOffset := 0
+  else
+    UseOffset := Car.Offset;
+
   // Calculate Offset vector (perpendicular to track)
   PerpX := -Sin(DegToRad(TargetPt.Angle));
   PerpY := Cos(DegToRad(TargetPt.Angle));
-  OffsetX := PerpX * Car.Offset;
-  OffsetY := PerpY * Car.Offset;
+  OffsetX := PerpX * UseOffset;
+  OffsetY := PerpY * UseOffset;
+
   DistToTarget := Sqrt(Sqr(Car.X - (TargetPt.X + OffsetX)) + Sqr(Car.Y - (TargetPt.Y + OffsetY)));
-  // Switch to next target if close
-  if DistToTarget < 80 then
+  PlainDist := Sqrt(Sqr(Car.X - TargetPt.X) + Sqr(Car.Y - TargetPt.Y));
+
+  // Vector projection to see if car has passed the waypoint
+  Seg := PointF(NextPt.X - TargetPt.X, NextPt.Y - TargetPt.Y);
+  CarToTargetVec := PointF(Car.X - TargetPt.X, Car.Y - TargetPt.Y);
+  Dot := (CarToTargetVec.X * Seg.X) + (CarToTargetVec.Y * Seg.Y);
+
+  // Dynamic switch radius based on speed to prevent overshoot
+  SwitchRadius := AI_WP_MIN_RADIUS + Abs(Car.Speed) * AI_WP_SPEED_FACTOR;
+
+  Car.WaypointTimer := Car.WaypointTimer + DeltaSec;
+  Switched := False;
+
+  // Switch to next target if close, projected past it, or timeout reached
+  if (PlainDist < 10) or (PlainDist < SwitchRadius) or (Dot > 0) then
+    Switched := True;
+  if Car.WaypointTimer > AI_WP_TIMEOUT then
+    Switched := True;
+
+  if Switched then
   begin
     Car.FTargetIndex := (Car.FTargetIndex + 1) mod Length(FTrackPoints);
+    Car.WaypointTimer := 0;
+
     TargetPt := FTrackPoints[Car.FTargetIndex];
-    OffsetX := -Sin(DegToRad(TargetPt.Angle)) * Car.Offset;
-    OffsetY := Cos(DegToRad(TargetPt.Angle)) * Car.Offset;
+    NextPt   := FTrackPoints[(Car.FTargetIndex + 1) mod Length(FTrackPoints)];
+    FarPt    := FTrackPoints[(Car.FTargetIndex + 2) mod Length(FTrackPoints)];
+
+    AngleDelta := Abs(TargetPt.Angle - NextPt.Angle);
+    if AngleDelta > 180 then AngleDelta := 360 - AngleDelta;
+    if AngleDelta > 12 then
+      UseOffset := 0
+    else
+      UseOffset := Car.Offset;
+
+    OffsetX := -Sin(DegToRad(TargetPt.Angle)) * UseOffset;
+    OffsetY := Cos(DegToRad(TargetPt.Angle)) * UseOffset;
+    DistToTarget := Sqrt(Sqr(Car.X - (TargetPt.X + OffsetX)) + Sqr(Car.Y - (TargetPt.Y + OffsetY)));
   end;
+
   // Steer towards target
   DesiredAngle := RadToDeg(ArcTan2((TargetPt.Y + OffsetY) - Car.Y, (TargetPt.X + OffsetX) - Car.X));
   AngleDiff := DesiredAngle - Car.Angle;
@@ -467,26 +634,53 @@ begin
     AngleDiff := AngleDiff - 360;
   if AngleDiff < -180 then
     AngleDiff := AngleDiff + 360;
-  // Basic AI physics
+
   OnTrack := IsOnTrack(Car.X, Car.Y, DistFromCenter);
-  Accel := 400; // Slightly higher accel
-  if not OnTrack then
-    Accel := 150;
-  Friction := 2.0;
-  if not OnTrack then
-    Friction := 3.0;
-  // Maintain speed
-  Car.Speed := Min(Car.Speed + Accel * DeltaSec, 320); // Slightly faster top speed
-  Car.Speed := Car.Speed - (Car.Speed * Friction * DeltaSec);
-  // Turn
+
+  // Rubber-banding: Speed up AI if behind player, slow down if ahead
+  LapDiff := FPlayerCar.LapsCompleted - Car.LapsCompleted;
+  RubberMul := 1.0;
+  if LapDiff >= 2 then
+    RubberMul := 1.12
+  else if LapDiff <= -2 then
+    RubberMul := 0.92;
+
+  LevelFactor := LevelMul;
+
+  // Look-ahead braking: check angle difference of upcoming segments
+  LookDelta := Abs(TargetPt.Angle - NextPt.Angle);
+  if LookDelta > 180 then LookDelta := 360 - LookDelta;
+  FarDelta := Abs(NextPt.Angle - FarPt.Angle);
+  if FarDelta > 180 then FarDelta := 360 - FarDelta;
+  if FarDelta > LookDelta then LookDelta := FarDelta;
+
+  CornerMul := 1.0;
+  if LookDelta > AI_CORNER_START then
+  begin
+    CornerMul := 1.0 - (LookDelta - AI_CORNER_START) / (AI_CORNER_FULL - AI_CORNER_START);
+    if CornerMul < AI_CORNER_MIN_MUL then
+      CornerMul := AI_CORNER_MIN_MUL;
+  end;
+
+  // Calculate final acceleration and max speed
+  Accel := AI_BASE_ACCEL * RubberMul * LevelFactor;
+  if not OnTrack then Accel := Accel * 0.4;
+  if Abs(AngleDiff) > 60 then Accel := Accel * 0.6; // Slow down on sharp turns
+  Accel := Accel * CornerMul;
+
+  MaxAI := AI_BASE_SPEED * RubberMul * LevelFactor * CornerMul;
+  Car.Speed := Min(Car.Speed + Accel * DeltaSec, MaxAI);
+
+  // Turn towards desired angle
   if Abs(Car.Speed) > 5 then
   begin
-    TurnSpeed := 150 * (Car.Speed / 320);
+    TurnSpeed := 150 * (Car.Speed / 320) * (0.7 + 0.3 * LevelFactor);
     if AngleDiff < 0 then
       Car.Angle := Car.Angle - Min(Abs(AngleDiff), TurnSpeed * DeltaSec)
     else
       Car.Angle := Car.Angle + Min(AngleDiff, TurnSpeed * DeltaSec);
   end;
+
   // Move
   Rad := DegToRad(Car.Angle);
   VX := Cos(Rad) * Car.Speed * DeltaSec;
@@ -495,12 +689,12 @@ begin
   Car.Y := Car.Y + VY;
   CheckLap(Car);
 end;
+
 {
   Resolves collisions between cars.
   Checks overlapping cars and pushes them apart, transferring momentum
   and adding a slight spin for visual effect.
 }
-
 procedure TSkiaMicroRacers.ResolveCollisions;
 var
   I, J: Integer;
@@ -546,25 +740,29 @@ begin
     end;
   end;
 end;
+
 {
   Checks if a car has crossed the finish line in the correct direction.
+  Uses the dynamically generated start index.
   Updates lap count and race state accordingly.
 }
-
 procedure TSkiaMicroRacers.CheckLap(Car: TCar);
 var
   DistToStart: Single;
   AngleDiff: Single;
+  StartPt: TTrackPoint;
+  I: Integer;
 begin
-  // Start line is at Point 3 (X=1400, Y=750)
-  DistToStart := Sqrt(Sqr(Car.X - FTrackPoints[3].X) + Sqr(Car.Y - FTrackPoints[3].Y));
+  StartPt := FTrackPoints[FStartIndex];
+  DistToStart := Sqrt(Sqr(Car.X - StartPt.X) + Sqr(Car.Y - StartPt.Y));
+
   // Check if car is close to the start/finish line
   if DistToStart < 90 then
   begin
     if not Car.CanCountLap then
     begin
       // Ensure the car is moving in the correct direction
-      AngleDiff := Abs(Car.Angle - FTrackPoints[3].Angle);
+      AngleDiff := Abs(Car.Angle - StartPt.Angle);
       if AngleDiff > 180 then
         AngleDiff := 360 - AngleDiff;
       if AngleDiff < 60 then
@@ -577,11 +775,15 @@ begin
           // Subsequent crossings mean the previous lap is fully completed.
           Car.LapsCompleted := Car.LapsCompleted + 1;
         Car.CanCountLap := True;
+
         // Check if race is finished for this car
         if (Car.LapsCompleted > FTotalLaps) and not Car.Finished then
         begin
           Car.Finished := True;
-          Car.FinalRank := FCars.Count;
+          Car.FinalRank := 1;
+          for I := 0 to FCars.Count - 1 do
+            if (FCars[I] <> Car) and FCars[I].Finished then
+              Inc(Car.FinalRank);
           CheckRaceFinish;
         end;
       end;
@@ -595,8 +797,8 @@ begin
       Car.CanCountLap := False;
   end;
 end;
-{ Ends the race if the player or all cars have finished. }
 
+{ Ends the race if all cars have finished or player has finished. Increments Level/Wins. }
 procedure TSkiaMicroRacers.CheckRaceFinish;
 var
   FinishedCount: Integer;
@@ -606,20 +808,24 @@ begin
   for I := 0 to FCars.Count - 1 do
     if FCars[I].Finished then
       Inc(FinishedCount);
-  if FPlayerCar.Finished or (FinishedCount = FCars.Count) then
+
+  if FinishedCount >= FCars.Count then
   begin
+    if FPlayerCar.FinalRank = 1 then
+      Inc(FWins);
     FGameState := gsFinished;
   end;
 end;
-{ Triggers the start sequence. }
 
+{ Triggers the start sequence. }
 procedure TSkiaMicroRacers.StartCountdown;
 begin
   FGameState := gsCountdown;
   FCountdownTimer := 4.0; // 3, 2, 1, GO!
+  FRaceTimer := 0;
 end;
-{ Safely triggers a redraw from a background thread using TThread.Queue }
 
+{ Safely triggers a redraw from a background thread using TThread.Queue }
 procedure TSkiaMicroRacers.SafeInvalidate;
 begin
   if csDestroying in ComponentState then
@@ -634,8 +840,8 @@ begin
       end;
     end);
 end;
-{ Initializes the background game loop thread }
 
+{ Initializes the background game loop thread }
 procedure TSkiaMicroRacers.StartThread;
 begin
   if Assigned(FThread) then
@@ -664,8 +870,8 @@ begin
   FThread.FreeOnTerminate := True;
   FThread.Start;
 end;
-{ Stops the background thread gracefully }
 
+{ Stops the background thread gracefully }
 procedure TSkiaMicroRacers.StopThread;
 begin
   FActive := False;
@@ -675,11 +881,11 @@ begin
     Sleep(50); // Give the thread a moment to exit its loop
   end;
 end;
+
 {
   Helper to measure text width for UI centering.
   Uses Skia's internal font metrics, with a fallback estimation.
 }
-
 function TSkiaMicroRacers.MeasureTextWidth(const AText: string; const AFont: ISkFont; const APaint: ISkPaint): Single;
 begin
   if not Assigned(AFont) or not Assigned(APaint) then
@@ -690,11 +896,11 @@ begin
     Result := AText.Length * (AFont.Size * 0.5);
   end;
 end;
+
 { DRAWING }
 {
   Main rendering method. Draws the world relative to the camera, then UI.
 }
-
 procedure TSkiaMicroRacers.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
 var
   Paint: ISkPaint;
@@ -714,16 +920,20 @@ begin
   ACanvas.Clear($FF1a3a1a);
   ScreenCX := Width / 2;
   ScreenCY := Height / 2;
+
   // 2. Apply Camera Transformations
   ACanvas.Save;
   ACanvas.Translate(ScreenCX, ScreenCY); // Move world to center of screen
   ACanvas.Rotate(-FCameraAngle);         // Rotate world opposite to camera
   ACanvas.Translate(-FCameraX, -FCameraY); // Pan world based on camera position
+
   Paint := TSkPaint.Create(TSkPaintStyle.Fill);
   Paint.AntiAlias := True;
-  // 3. Draw Grass Area (World Bounds)
+
+  // 3. Draw Grass Area (World Bounds covering the generated track)
   Paint.Color := $FF2E8B57;
-  ACanvas.DrawRect(TRectF.Create(0, 0, 2000, 1500), Paint);
+  ACanvas.DrawRect(TRectF.Create(0, 0, 3000, 3000), Paint);
+
   // 4. Build Track Path
   PathBuilder := TSkPathBuilder.Create;
   PathBuilder.MoveTo(FTrackPoints[0].X, FTrackPoints[0].Y);
@@ -731,6 +941,7 @@ begin
     PathBuilder.LineTo(FTrackPoints[I].X, FTrackPoints[I].Y);
   PathBuilder.Close; // Close the loop
   TrackPath := PathBuilder.Detach;
+
   // 5. Draw Track Asphalt
   Paint.Style := TSkPaintStyle.Stroke;
   Paint.Color := $FF333333;
@@ -738,6 +949,7 @@ begin
   Paint.StrokeCap := TSkStrokeCap.Round;
   Paint.StrokeJoin := TSkStrokeJoin.Round;
   ACanvas.DrawPath(TrackPath, Paint);
+
   // 6. Draw Center Dashed Line
   Paint.Color := $FFFFFF00;
   Paint.StrokeWidth := 4;
@@ -745,18 +957,24 @@ begin
   Paint.PathEffect := DashPathEffect;
   ACanvas.DrawPath(TrackPath, Paint);
   Paint.PathEffect := nil; // Reset effect
-  // 7. Draw Start/Finish Line (Checkered pattern) at Point 3
+
+  // 7. Draw Start/Finish Line (Checkered pattern) at StartIndex
   Paint.Style := TSkPaintStyle.Fill;
-  PerpX := -Sin(DegToRad(FTrackPoints[3].Angle));
-  PerpY := Cos(DegToRad(FTrackPoints[3].Angle));
+  PerpX := -Sin(DegToRad(FTrackPoints[FStartIndex].Angle));
+  PerpY := Cos(DegToRad(FTrackPoints[FStartIndex].Angle));
   for I := -4 to 4 do
   begin
     if I mod 2 = 0 then
       Paint.Color := $FFFFFFFF
     else
       Paint.Color := $FF000000;
-    ACanvas.DrawRect(TRectF.Create(FTrackPoints[3].X + (PerpX * I * 20) - 10, FTrackPoints[3].Y + (PerpY * I * 20) - 10, FTrackPoints[3].X + (PerpX * I * 20) + 10, FTrackPoints[3].Y + (PerpY * I * 20) + 10), Paint);
+    ACanvas.DrawRect(TRectF.Create(
+      FTrackPoints[FStartIndex].X + (PerpX * I * 20) - 10,
+      FTrackPoints[FStartIndex].Y + (PerpY * I * 20) - 10,
+      FTrackPoints[FStartIndex].X + (PerpX * I * 20) + 10,
+      FTrackPoints[FStartIndex].Y + (PerpY * I * 20) + 10), Paint);
   end;
+
   // 8. Draw Cars
   for Car in FCars do
   begin
@@ -773,12 +991,15 @@ begin
     ACanvas.DrawCircle(PointF(12, 6), 2, Paint);
     ACanvas.Restore;
   end;
+
   ACanvas.Restore; // Restore canvas to screen state (for UI)
+
   // 9. Draw UI (Screen Space)
   Font := TSkFont.Create;
   Paint := TSkPaint.Create;
   Paint.Style := TSkPaintStyle.Fill;
   Paint.AntiAlias := True;
+
   case FGameState of
     gsReady:
       begin
@@ -787,11 +1008,16 @@ begin
         ACanvas.DrawRect(ADest, Paint);
         Paint.Color := TAlphaColors.White;
         Font.Size := 48;
-        TextWidth := MeasureTextWidth('MICRO MACHINES', Font, Paint);
-        ACanvas.DrawSimpleText('MICRO MACHINES', (Width - TextWidth) / 2, Height / 2 - 50, Font, Paint);
+        TextWidth := MeasureTextWidth('MICRO RACERS', Font, Paint);
+        ACanvas.DrawSimpleText('MICRO RACERS', (Width - TextWidth) / 2, Height / 2 - 50, Font, Paint);
+
+        Font.Size := 24;
+        TextWidth := MeasureTextWidth('Level ' + IntToStr(FLevel) + '   Wins ' + IntToStr(FWins), Font, Paint);
+        ACanvas.DrawSimpleText('Level ' + IntToStr(FLevel) + '   Wins ' + IntToStr(FWins), (Width - TextWidth) / 2, Height / 2, Font, Paint);
+
         Font.Size := 24;
         TextWidth := MeasureTextWidth('Press ENTER to Start', Font, Paint);
-        ACanvas.DrawSimpleText('Press ENTER to Start', (Width - TextWidth) / 2, Height / 2 + 20, Font, Paint);
+        ACanvas.DrawSimpleText('Press ENTER to Start', (Width - TextWidth) / 2, Height / 2 + 40, Font, Paint);
       end;
     gsCountdown:
       begin
@@ -813,27 +1039,24 @@ begin
       begin
         Paint.Color := TAlphaColors.White;
         Font.Size := 20;
-        // UI Display Logic:
-        // Start: Lap=0, Done=0. Display: Lap 1/3, Done 0.
-        // Cross line 1st time: Lap=1, Done=0. Display: Lap 1/3, Done 0.
-        // Cross line 2nd time: Lap=2, Done=1. Display: Lap 2/3, Done 1.
-        // Cross line 3rd time: Lap=3, Done=2. Display: Lap 3/3, Done 2.
-        // Cross line 4th time: Lap=4, Done=3. Race ends.
+        // UI Display Logic
         DisplayLap := FPlayerCar.LapsCompleted;
         if DisplayLap = 0 then
-          DisplayLap := 1; // 0 completed means you are in Lap 1
+          DisplayLap := 1;
         if DisplayLap > FTotalLaps then
           DisplayLap := FTotalLaps;
         DisplayDone := FPlayerCar.LapsCompleted;
         if DisplayDone > 0 then
-          DisplayDone := DisplayDone - 1; // If you're in Lap 2, you've done 1.
+          DisplayDone := DisplayDone - 1;
+
         ACanvas.DrawSimpleText('Lap: ' + IntToStr(DisplayLap) + '/' + IntToStr(FTotalLaps), 10, 30, Font, Paint);
         ACanvas.DrawSimpleText('Done: ' + IntToStr(DisplayDone) + '/' + IntToStr(FTotalLaps), 10, 60, Font, Paint);
+        ACanvas.DrawSimpleText('Time: ' + FloatToStrF(FRaceTimer, ffFixed, 5, 2), 10, 90, Font, Paint);
+
         // Draw rankings on right side
         for I := 0 to FCars.Count - 1 do
         begin
           Car := FCars[I];
-          // Calculate the done value for EACH car specifically
           DisplayDone := Car.LapsCompleted;
           if DisplayDone > 0 then
             DisplayDone := DisplayDone - 1;
@@ -844,10 +1067,23 @@ begin
       begin
         Paint.Color := $88000000;
         ACanvas.DrawRect(ADest, Paint);
+
+        if FPlayerCar.FinalRank = 1 then
+        begin
+          Paint.Color := TAlphaColors.Yellow;
+          Font.Size := 48;
+          TextWidth := MeasureTextWidth('YOU WIN!', Font, Paint);
+          ACanvas.DrawSimpleText('YOU WIN!', (Width - TextWidth) / 2, 80, Font, Paint);
+        end
+        else
+        begin
+          Paint.Color := TAlphaColors.Red;
+          Font.Size := 48;
+          TextWidth := MeasureTextWidth('YOU LOST', Font, Paint);
+          ACanvas.DrawSimpleText('YOU LOST', (Width - TextWidth) / 2, 80, Font, Paint);
+        end;
+
         Paint.Color := TAlphaColors.White;
-        Font.Size := 40;
-        TextWidth := MeasureTextWidth('RACE FINISHED!', Font, Paint);
-        ACanvas.DrawSimpleText('RACE FINISHED!', (Width - TextWidth) / 2, 80, Font, Paint);
         Font.Size := 24;
         for I := 0 to FCars.Count - 1 do
         begin
@@ -858,6 +1094,7 @@ begin
             Paint.Color := TAlphaColors.White;
           ACanvas.DrawSimpleText(IntToStr(I + 1) + '. ' + Car.Name + ' (Laps: ' + IntToStr(Car.LapsCompleted - 1) + ')', (Width / 2) - 100, 150 + (I * 35), Font, Paint);
         end;
+
         Paint.Color := TAlphaColors.White;
         Font.Size := 18;
         TextWidth := MeasureTextWidth('Press R to Restart', Font, Paint);
@@ -865,8 +1102,8 @@ begin
       end;
   end;
 end;
-{ Input Handlers: Capture keys and store them in a set. Thread-safe. }
 
+{ Input Handlers: Capture keys and store them in a set. Thread-safe. }
 procedure TSkiaMicroRacers.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
 var
   C: WideChar;
@@ -899,6 +1136,7 @@ begin
   finally
     FLock.Release;
   end;
+
   // Game State Triggers
   if FGameState = gsReady then
   begin
@@ -908,7 +1146,13 @@ begin
   else if FGameState = gsFinished then
   begin
     if (C = 'R') then
+    begin
+      // Increase level if player won
+      if FPlayerCar.FinalRank = 1 then
+        Inc(FLevel);
       InitRace;
+      StartCountdown;
+    end;
   end;
   Key := 0;
   KeyChar := #0;
@@ -951,4 +1195,3 @@ begin
 end;
 
 end.
-
