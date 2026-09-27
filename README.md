@@ -1,7 +1,7 @@
 # SkiaMicroRacers
 A Micro Machines style top-down racing game prototype built entirely with Skia4Delphi.    
      
-SkiaMicroRacers v0.1     
+SkiaMicroRacers v0.2     
     
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/LaMitaOne/SkiaMicroRacers)    
      
@@ -17,6 +17,23 @@ Features:
     Multithreaded Game Loop: Background physics and rendering thread for smooth 60 FPS gameplay.
                 
 Zipped exe and sample project included.    
+        
+Changelog:    
+        
+Version 0.2 - "The Great Ping-Pong Port"   
+   
+     The Ping-Pong Port: Successfully reverse-engineered and ported back the brilliant track generation and AI logic from Guvacode's C/FPC + Raylib port back to Skia4Delphi. What goes around, comes around in 24 hours!   
+     Procedural Tracks: Replaced the static oval with a procedural star-shaped track generator (polar coordinates + noise). Tracks are now dynamically validated to ensure no impossible corners.   
+     Dynamic Start Line: The start/finish line is now placed dynamically on the flattest section of the generated track.   
+     Next-Gen AI Look-Ahead: AI now scans two waypoints ahead and dynamically brakes (CornerMul) before sharp turns to prevent overshooting.   
+     Rubber-Banding AI: AI speed scales dynamically based on lap difference. If they fall behind, they get a slight speed boost; if they run away, they ease off. Keeps races neck-and-neck!   
+     Smart Waypoint Switching: AI waypoint progression is now calculated via vector projection and speed-dependent radius, preventing AI cars from circling endlessly around a single point.    
+     Stuck-Timer (Timeout): Added a 2-second fallback timer that forces the AI to switch waypoints if they get stuck or rammed off-track.
+     Level & Progression System: Winning a race now increments the level. AI gets fundamentally faster (LevelMul) while the player gets a slight max-speed bonus to keep up.   
+      
+GuvaCode C/FPC/raylib ports:    
+  FPC/raylib https://github.com/GuvaCode/MicroRacers-FPC-Ray4Laz-port     
+  C/raylib https://github.com/GuvaCode/MicroRacers-Top-Down-Racer-Prototype-C-port    
       
      
 🎮 Skia4Delphi Games (each one file, no ext engine):    
@@ -42,5 +59,5 @@ If you want to tip me a coffee.. :)
     <img src="https://www.paypalobjects.com/en_US/i/btn/btn_donate_LG.gif" alt="Donate with PayPal"/>
   </a>
 </p>
-        
 
+   
